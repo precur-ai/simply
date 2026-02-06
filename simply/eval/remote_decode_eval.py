@@ -113,11 +113,13 @@ def main(argv: Sequence[str]) -> None:
 
   dataiter_state = None
   num_past_examples = 0
+  total_generation_time = 0.0
   iter_state_path = get_last_file(experiment_dir, r'iter_state_(\d+)\.json')
   if iter_state_path is not None:
     iter_state = pytree.load_pytree_from(iter_state_path)
     dataiter_state = iter_state['dataiter']
     num_past_examples = iter_state['num_past_examples']
+    total_generation_time = iter_state['total_generation_time']
 
   logging.info('dataiter_state=%s', dataiter_state)
   logging.info('num_past_examples=%d', num_past_examples)
@@ -128,9 +130,14 @@ def main(argv: Sequence[str]) -> None:
       f'Starting to decode from example {num_past_examples}.'
   )
 
-  def query_and_evaluate(example: Mapping[str, Any]) -> Mapping[str, Any]:
+  def query_and_evaluate(
+      index: int, example: Mapping[str, Any]
+  ) -> Mapping[str, Any]:
     """Queries the server and evaluates the response."""
     request = evaluation.get_messages(example)
+    assert pytree.tree_is_sequence(request)
+    logging.info('enqueue index=%s', index)
+    request[0]['__index__'] = index
     while True:
       try:
         response = serving_common.struct_pb_to_py(
@@ -144,7 +151,7 @@ def main(argv: Sequence[str]) -> None:
     result = evaluation.evaluate(responsed_example, response['output_text'])
     return responsed_example | result
 
-  dataset = dataset.map(query_and_evaluate)
+  dataset = dataset.map_with_index(query_and_evaluate)
   dataset = dataset.to_iter_dataset(
       grain.ReadOptions(num_threads=128, prefetch_buffer_size=4096)
   )
@@ -160,7 +167,8 @@ def main(argv: Sequence[str]) -> None:
     num_past_examples += 1
     logging.info('Completed %d examples', num_past_examples)
     generation_time = time.time() - start_time
-    history.append(example | dict(lm_avg_generation_time=generation_time))
+    total_generation_time += generation_time
+    history.append(example)
 
     # Save the history if we have processed `save_every_n` examples or we have
     # finished all the epochs.
@@ -171,10 +179,8 @@ def main(argv: Sequence[str]) -> None:
       logging.info('Saving history %d', num_past_examples)
       history_path = experiment_dir / f'history_{num_past_examples}.jsonl'
       history_tmp_path = history_path.with_suffix('.tmp')
-      total_generation_time = 0.0
       with history_tmp_path.open('w') as f:
         for example in history:
-          total_generation_time += example['lm_avg_generation_time']
           print(f'{example=}')
           json.dump(pytree.dump(example), f)
           f.write('\n')
@@ -189,14 +195,13 @@ def main(argv: Sequence[str]) -> None:
           dict(
               dataiter=dataiter.get_state(),
               num_past_examples=num_past_examples,
+              total_generation_time=total_generation_time,
           ),
           iter_state_tmp_path,
       )
       iter_state_tmp_path.rename(iter_state_path)
 
-      avg_generation_time = total_generation_time / (
-          num_past_examples - num_saved_examples
-      )
+      avg_generation_time = total_generation_time / num_past_examples
       experiment_helper.set_notes(
           f'Completed {num_past_examples}/{num_total_examples} examples,'
           f' {avg_generation_time:.2f} s/example'
@@ -209,18 +214,15 @@ def main(argv: Sequence[str]) -> None:
   def _stats_history(history_path: epath.PathLike) -> Mapping[str, int | float]:
     correct = 0
     total = 0
-    total_generation_time = 0.0
     history_path = epath.Path(history_path)
     with history_path.open() as f:
       for x in f:
         example = pytree.load(json.loads(x))
         correct += example['correct']
-        total_generation_time += example['lm_avg_generation_time']
         total += 1
     return dict(
         correct=correct,
         total=total,
-        total_generation_time=total_generation_time,
     )
 
   async def _stats_all_history() -> Mapping[str, int | float]:
@@ -245,7 +247,6 @@ def main(argv: Sequence[str]) -> None:
   logging.info('results=%s', results)
   correct = results['correct']
   total = results['total']
-  total_generation_time = results['total_generation_time']
 
   experiment_helper.set_notes(
       f'Finished: accuracy is {correct=}/{total=} ='

@@ -193,7 +193,10 @@ class Batcher:
 
   def loop(self, stop_event: threading.Event):
     """The batcher loop."""
-    sharding.set_mesh(self.config.mesh_shape)
+    sharding.set_mesh(
+        self.config.mesh_shape,
+        axis_names=self.config.sharding_config.mesh_axis_names,
+    )
     seed = int(time.time() * 1000)
     seed = multihost_utils.broadcast_one_to_all(seed)
 
@@ -443,7 +446,9 @@ async def main(argv: Sequence[str]) -> None:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
-  sharding.set_mesh(mesh_shape)
+  sharding.set_mesh(
+      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
+  )
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
   if vocab_name := _VOCAB_NAME.value:
@@ -458,11 +463,23 @@ async def main(argv: Sequence[str]) -> None:
     if (ckpt_format := _CKPT_FORMAT.value) is not None:
       config_replace_kwargs['init_ckpt_format'] = ckpt_format
   page_size = 128
-  total_num_pages = (
-      (_MAX_SEQ_LEN.value - 1 + page_size - 1) // page_size * _BATCH_SIZE.value
+  global_total_num_pages = (
+      rpa.max_num_pages_per_seq(_MAX_SEQ_LEN.value, page_size, None)
+      * _BATCH_SIZE.value
   )
-  config_replace_kwargs['global_total_num_pages'] = total_num_pages
-  config_replace_kwargs['local_total_num_pages'] = total_num_pages
+  local_total_num_pages = (
+      rpa.max_num_pages_per_seq(
+          _MAX_SEQ_LEN.value, page_size, config.window_size
+      )
+      * _BATCH_SIZE.value
+  )
+  logging.info(
+      'global_total_num_pages=%d, local_total_num_pages=%d',
+      global_total_num_pages,
+      local_total_num_pages,
+  )
+  config_replace_kwargs['global_total_num_pages'] = global_total_num_pages
+  config_replace_kwargs['local_total_num_pages'] = local_total_num_pages
   config_replace_kwargs['page_size'] = page_size
 
   if not (lm_format_name := _LM_FORMAT.value):

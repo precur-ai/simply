@@ -962,7 +962,7 @@ def run_experiment(
 
   eval_iter = None
   eval_iter_init_state = None
-  if config.use_validation_set:
+  if config.validation_dataset:
     eval_set = data_lib.create_iter_dataset(config, training=False)
     eval_iter = iter(eval_set)
     # This usually is not needed, just in case eval_set.__iter__ is adopting
@@ -1102,7 +1102,7 @@ def run_experiment(
         )
 
         sampling_inputs: list[RewardedSample] = []
-        for example in common.convert_columns_to_rows(next(train_iter)):
+        for example in next(train_iter):
           sampling_inputs.append(
               RewardedSample(
                   raw_example=example,
@@ -1335,7 +1335,7 @@ def run_experiment(
         )
 
         # TODO: Merge this process with xm decode eval script.
-        if config.use_validation_set and (
+        if config.validation_dataset and (
             steps % config.validation_eval_interval == 0
             or steps == config.num_train_steps
         ):
@@ -1367,7 +1367,7 @@ def run_experiment(
               ):
                 break
               eval_prompt_batch = []
-              for example in common.convert_columns_to_rows(eval_batch):
+              for example in eval_batch:
                 eval_prompt_batch.append(
                     evaluation.get_sampling_input(example, lm_format)
                 )

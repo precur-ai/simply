@@ -1212,39 +1212,7 @@ class Attention(module.SimplyModule):
   total_num_pages: int = 0
   page_size: int = 0
   # Position encoding (None = NoPE, no positional encoding).
-  position_encoding: pe_lib.PositionEncodingConfig | None = None
-
-  @property
-  def rope_max_timescale(self) -> int:
-    """Backward compatibility. Use position_encoding instead."""
-    warnings.warn(
-        'rope_max_timescale is deprecated. Use position_encoding instead.',
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if self.position_encoding is None:
-      return -1  # NoPE - no positional encoding
-    if isinstance(self.position_encoding, pe_lib.RoPE):
-      return self.position_encoding.max_timescale
-    raise TypeError(
-        f'rope_max_timescale not supported for {type(self.position_encoding)}'
-    )
-
-  @property
-  def rope_scale_factor(self) -> float:
-    """Backward compatibility. Use position_encoding instead."""
-    warnings.warn(
-        'rope_scale_factor is deprecated. Use position_encoding instead.',
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if self.position_encoding is None:
-      return -1.0  # NoPE - no positional encoding
-    if isinstance(self.position_encoding, pe_lib.RoPE):
-      return self.position_encoding.scale_factor
-    raise TypeError(
-        f'rope_scale_factor not supported for {type(self.position_encoding)}'
-    )
+  position_encoding: pe_lib.PositionEncodingConfig | None = pe_lib.RoPE()
 
   def setup(self) -> None:
     if self.use_per_dim_scale:
@@ -1567,9 +1535,6 @@ class Attention(module.SimplyModule):
         max_seq_len=max_seq_len,
         window_size=self.window_size if self.window_size > 0 else None,
         head_partition=head_partition,
-        # TODO: Auto tune these parameters.
-        num_kv_pages_per_block=4,
-        num_queries_per_block=32,
     ).init()
 
 
@@ -1614,7 +1579,7 @@ class TransformerBlock(module.SimplyModule):
   attn_soft_cap: float = 50.0  # If negative, no softcap.
   rms_norm_epsilon: float = 1e-6
   # Position encoding config (None = NoPE, no positional encoding).
-  position_encoding: pe_lib.PositionEncodingConfig | None = None
+  position_encoding: pe_lib.PositionEncodingConfig | None = pe_lib.RoPE()
   query_scale: float = -1.0
   # tile sizes for gmm.
   tile_batch_seq: int = 128
@@ -1893,12 +1858,12 @@ class TransformerLM(module.SimplyModule):
     ), f'Duplicate input encoder name: {names}'
 
     def _create_transformer_block(pattern):
-      total_num_pages = config.global_total_num_pages
       # Get position encoding config for this pattern (None = NoPE).
       if isinstance(config.position_encoding, Mapping):
         pe = config.position_encoding.get(pattern)
       else:
         pe = config.position_encoding  # Single config applies to all patterns
+      total_num_pages = config.global_total_num_pages
       if pattern == 'local':
         total_num_pages = config.local_total_num_pages
       return TransformerBlock(
@@ -2748,7 +2713,7 @@ def run_experiment(
   steps = int(state['steps'])
 
   # Create eval_fn for validation set.
-  if config.use_validation_set:
+  if config.validation_dataset:
     loss_fn = common.named_jit(
         compute_eval_loss, 'validation_loss_fn', model=model
     )
@@ -2771,7 +2736,7 @@ def run_experiment(
       logging.info('steps: %s', steps)
       helper.save_ckpt(state, steps, data=train_iter.get_state())
       # Run eval every validation_eval_interval steps and at the very end.
-      if config.use_validation_set and (
+      if config.validation_dataset and (
           steps % config.validation_eval_interval == 0
           or steps == config.num_train_steps
       ):

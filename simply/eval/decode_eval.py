@@ -187,7 +187,9 @@ def main(argv: Sequence[str]) -> None:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
-  sharding.set_mesh(mesh_shape)
+  sharding.set_mesh(
+      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
+  )
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
   if vocab_name := _VOCAB_NAME.value:
@@ -288,11 +290,13 @@ def main(argv: Sequence[str]) -> None:
 
   dataiter_state = None
   num_past_examples = 0
+  total_generation_time = 0.0
   iter_state_path = get_last_file(experiment_dir, r'iter_state_(\d+)\.json')
   if iter_state_path is not None:
     iter_state = pytree.load_pytree_from(iter_state_path)
     dataiter_state = iter_state['dataiter']
     num_past_examples = iter_state['num_past_examples']
+    total_generation_time = iter_state['total_generation_time']
     prng_key = jnp.asarray(iter_state['prng_key'])
 
   dataiter = dataset.batch(
@@ -312,9 +316,9 @@ def main(argv: Sequence[str]) -> None:
   )
 
   history = []
-  total_generation_time = 0.0
   num_saved_examples = num_past_examples
   for batch in dataiter:
+    start_time = time.time()
     logging.info(
         'Processing batch %d - %d.',
         num_past_examples,
@@ -325,7 +329,6 @@ def main(argv: Sequence[str]) -> None:
     for example in batch:
       sampling_inputs.append(evaluation.get_sampling_input(example, lm_format))
 
-    start_time = time.time()
     prng_key, subkey = jax.random.split(prng_key)
     sampling_outputs = lm_interface.generate(
         sampling_inputs,
@@ -340,7 +343,6 @@ def main(argv: Sequence[str]) -> None:
         num_past_examples + len(batch),
         generation_time,
     )
-    total_generation_time += generation_time
 
     for example, si, so in zip(
         batch, sampling_inputs, sampling_outputs, strict=True
@@ -348,9 +350,6 @@ def main(argv: Sequence[str]) -> None:
       assert len(so) == 1
       rewarded_sample = dict(
           **example, lm_request=si, lm_response=so[0].output_text
-      )
-      rewarded_sample['lm_avg_generation_time'] = (
-          generation_time / _BATCH_SIZE.value
       )
       if experiment_helper.is_primary_process():
         result = evaluation.evaluate(example, rewarded_sample['lm_response'])
@@ -365,6 +364,9 @@ def main(argv: Sequence[str]) -> None:
             len(so[0].output_token_ids),
         )
       num_past_examples += 1
+
+    generation_time = time.time() - start_time
+    total_generation_time += generation_time
 
     # Save the history if we have processed `save_every_n` examples or we have
     # finished all the epochs.
@@ -391,38 +393,33 @@ def main(argv: Sequence[str]) -> None:
             dict(
                 dataiter=dataiter.get_state(),
                 num_past_examples=num_past_examples,
+                total_generation_time=total_generation_time,
                 prng_key=np.asarray(jax.random.key_data(prng_key)),
             ),
             iter_state_tmp_path,
         )
         iter_state_tmp_path.rename(iter_state_path)
 
-        avg_generation_time = total_generation_time / (
-            num_past_examples - num_saved_examples
-        )
+        avg_generation_time = total_generation_time / num_past_examples
         experiment_helper.set_notes(
             f'Completed {num_past_examples}/{num_total_examples} examples,'
             f' {avg_generation_time:.2f} s/example'
         )
       history = []
-      total_generation_time = 0.0
       num_saved_examples = num_past_examples
 
   def _stats_history(history_path: epath.PathLike) -> Mapping[str, int | float]:
     correct = 0
     total = 0
-    total_generation_time = 0.0
     history_path = epath.Path(history_path)
     with history_path.open() as f:
       for x in f:
         example = pytree.load(json.loads(x))
         correct += example['correct']
-        total_generation_time += example['lm_avg_generation_time']
         total += 1
     return dict(
         correct=correct,
         total=total,
-        total_generation_time=total_generation_time,
     )
 
   async def _stats_all_history() -> Mapping[str, int | float]:
@@ -449,7 +446,6 @@ def main(argv: Sequence[str]) -> None:
 
     correct = results['correct']
     total = results['total']
-    total_generation_time = results['total_generation_time']
 
     experiment_helper.set_notes(
         f'Finished: accuracy is {correct=}/{total=} ='

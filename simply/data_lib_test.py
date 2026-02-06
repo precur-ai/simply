@@ -344,7 +344,7 @@ class GetDataSourceTest(absltest.TestCase):
     """Test that getting unknown source raises error."""
     config = data_lib.DatasetConfig(source='nonexistent_source')
     with self.assertRaises(ValueError):
-      data_lib.get_data_source(config)
+      data_lib.get_data_source(config.source)
 
 
 ################################################################################
@@ -355,8 +355,8 @@ class GetDataSourceTest(absltest.TestCase):
 @dataclasses.dataclass
 class MockExperimentConfig:
   """Mock experiment config for testing."""
-  dataset_config: typing.Any
-  validation_dataset_config: typing.Any = None
+  dataset: typing.Any
+  validation_dataset: typing.Any = None
   vocab_name: str = 'test_tokenizer'
   seq_len: int = 8
   batch_size: int = 2
@@ -391,7 +391,7 @@ class CreateIterDatasetTest(absltest.TestCase):
   def test_produces_correct_batch_shape(self):
     """Test that output batches have correct shape."""
     ds_config = data_lib.DatasetConfig(source='test_source')
-    config = MockExperimentConfig(dataset_config=ds_config)
+    config = MockExperimentConfig(dataset=ds_config)
     dataset = data_lib.create_iter_dataset(config, training=True)
 
     batch = next(iter(dataset))
@@ -403,8 +403,8 @@ class CreateIterDatasetTest(absltest.TestCase):
     """Test validation mode produces finite number of batches."""
     ds_config = data_lib.DatasetConfig(source='test_source')
     config = MockExperimentConfig(
-        dataset_config=ds_config,
-        validation_dataset_config=ds_config,
+        dataset=ds_config,
+        validation_dataset=ds_config,
     )
     dataset = data_lib.create_iter_dataset(config, training=False)
 
@@ -413,10 +413,11 @@ class CreateIterDatasetTest(absltest.TestCase):
 
   def test_batch_contents_correct(self):
     """Test that batch contents are tokenized correctly."""
-    ds_config = data_lib.DatasetConfig(source='test_source')
+    ds_config = data_lib.DatasetConfig(
+        source='test_source', add_bos=True, add_eos=True)
     config = MockExperimentConfig(
-        dataset_config=ds_config,
-        validation_dataset_config=ds_config,
+        dataset=ds_config,
+        validation_dataset=ds_config,
     )
     dataset = data_lib.create_iter_dataset(config, training=False)
 
@@ -424,8 +425,8 @@ class CreateIterDatasetTest(absltest.TestCase):
     # First example: 'aaa' -> [97, 97, 97, eos=2]
     # After NextTokenPred: input=[97, 97, 97], target=[97, 97, 2]
     # After padding to seq_len=8
-    expected_input = np.array([97, 97, 97, 0, 0, 0, 0, 0], dtype=np.int32)
-    expected_target = np.array([97, 97, 2, 0, 0, 0, 0, 0], dtype=np.int32)
+    expected_input = np.array([1, 97, 97, 97, 0, 0, 0, 0], dtype=np.int32)
+    expected_target = np.array([97, 97, 97, 2, 0, 0, 0, 0], dtype=np.int32)
 
     np.testing.assert_array_equal(
         batch['decoder_input_tokens'][0], expected_input
@@ -476,7 +477,7 @@ class MixtureDatasetTest(absltest.TestCase):
             (data_lib.DatasetConfig(source='mix_source2'), 0.5),
         )
     )
-    config = MockExperimentConfig(dataset_config=mixture_config)
+    config = MockExperimentConfig(dataset=mixture_config)
     dataset = data_lib.create_iter_dataset(config, training=True)
 
     batch = next(iter(dataset))
@@ -491,7 +492,7 @@ class MixtureDatasetTest(absltest.TestCase):
         ),
         pack_before_mix=True,
     )
-    config = MockExperimentConfig(dataset_config=mixture_config, seq_len=16)
+    config = MockExperimentConfig(dataset=mixture_config, seq_len=16)
     dataset = data_lib.create_iter_dataset(config, training=True)
 
     batch = next(iter(dataset))

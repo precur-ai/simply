@@ -17,6 +17,7 @@ import collections
 from collections.abc import Callable, Hashable, Iterable, Mapping, MutableMapping, Sequence
 import dataclasses
 import functools
+import math
 from typing import Any, Self
 
 from absl import logging
@@ -33,6 +34,74 @@ from simply.utils import sharding
 RaggedArray = common.RaggedArray
 
 
+def autotune_block_sizes(
+    *,
+    num_kv_heads: int,
+    num_q_heads: int,
+    page_size: int,
+    max_seq_len: int,
+    per_head_dim: int,
+    window_size: int | None,
+    dtype: jax.typing.DTypeLike,
+    max_num_issue_tokens: int = np.iinfo(np.int32).max,
+):
+  """Autotunes block sizes for ragged paged attention."""
+  # TODO: More analysis on this value.
+  # Increasing this value would shift the attention module from memory bandwidth
+  # bound to compute bound, but in the meanwhile, it would cause more padding
+  # overhead, given decoding does one-by-one token generation. 32 is a good
+  # emperical trade-off so far.
+  num_queries_per_block = min(32, max_num_issue_tokens)
+  _, num_combined_kv_heads = (
+      ragged_paged_attention.kernel.get_min_heads_per_blk(
+          num_q_heads,
+          num_kv_heads * 2,
+          dtype,
+          dtype,
+      )
+  )
+
+  # This is an emperical estimation of the DMA issuing/waiting overhead
+  # (non-data-transport cost). It indicates the multiplication of the overhead
+  # latency and max HBM->VMEM bandwidth.
+  # We assume at each new TPU generation, the overhead latency would be reduced
+  # and in the meanwhile the HBM->VMEM bandwidth would be increased. Therefore,
+  # the equivalent bytes of the overhead should remain at the similar level.
+  dma_overhead_equivalent_bytes = 0.5 * 1024 * 1024  # 0.5MiB
+  dma_overhead = dma_overhead_equivalent_bytes / (
+      page_size
+      * num_combined_kv_heads
+      * per_head_dim
+      * jnp.dtype(dtype).itemsize
+  )
+  padding_overhead_per_kv_page_blk = (page_size / 2) / min(
+      window_size + 1 if window_size else max_seq_len, max_seq_len / 4
+  )
+  num_kv_pages_per_block = round(
+      math.sqrt(dma_overhead / padding_overhead_per_kv_page_blk)
+  )
+  max_num_kv_pages_upper_bound = max_num_pages_per_seq(
+      max_seq_len, page_size, window_size
+  )
+  return (
+      min(num_kv_pages_per_block, max_num_kv_pages_upper_bound),
+      num_queries_per_block,
+  )
+
+
+def max_num_pages_per_seq(
+    max_seq_len: int,
+    page_size: int,
+    window_size: int | None,  # self excluded
+) -> int:
+  """Returns the maximum number of pages per sequence."""
+  upper_bound = (max_seq_len - 1 + page_size - 1) // page_size
+  if window_size is None:
+    return upper_bound
+  num_pages_for_window = (window_size + page_size - 1) // page_size
+  return min(upper_bound, num_pages_for_window + 1)
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class DecodeStateConfig:
   """Paged KV cache config."""
@@ -44,7 +113,7 @@ class DecodeStateConfig:
   batch_size: int
   dtype: str
   max_seq_len: int
-  window_size: int | None = None
+  window_size: int | None = None  # self excluded
   head_partition: str | Sequence[str] | None = None
   num_kv_pages_per_block: int | None = None
   num_queries_per_block: int | None = None
@@ -55,7 +124,9 @@ class DecodeStateConfig:
 
   @property
   def max_num_pages_per_seq(self) -> int:
-    return (self.max_seq_len - 1 + self.page_size - 1) // self.page_size
+    return max_num_pages_per_seq(
+        self.max_seq_len, self.page_size, self.window_size
+    )
 
   def init(self) -> 'DecodeState':
     # TODO: Support data sharding
@@ -93,7 +164,7 @@ class DecodeStateConfig:
 class DecodeState:
   """Paged KV cache."""
 
-  # [total_num_pages, page_size, n_kv_heads * 2, padded_per_head_dim]
+  # [total_num_pages, page_size, num_kv_heads * 2, padded_per_head_dim]
   pages: jax.Array
   page_indices: jax.Array  # i32[batch_size, max_num_pages_per_seq]
   available_page_indices: jax.Array  # i32[total_num_pages]
@@ -116,9 +187,9 @@ class DecodeState:
 
   def __post_init__(self):
     head_partition_size = sharding.get_partition_size(self.head_partition)
-    if self.n_kv_heads % head_partition_size != 0:
+    if self.num_kv_heads % head_partition_size != 0:
       raise ValueError(
-          f'{self.n_kv_heads=} must be a multiple of {head_partition_size=}'
+          f'{self.num_kv_heads=} must be a multiple of {head_partition_size=}'
       )
     if self.page_indices.shape != (self.batch_size, self.max_num_pages_per_seq):
       raise ValueError(
@@ -157,15 +228,10 @@ class DecodeState:
           self.window_size,
       )
       object.__setattr__(self, 'window_size', None)
-    if self.window_size is None or self.window_size >= self.max_seq_len:
-      if self.max_seq_len > self.total_num_pages * self.page_size + 1:
-        raise ValueError(
-            f'{self.max_seq_len=} must be <='
-            f' {self.total_num_pages * self.page_size + 1=}'
-        )
-    else:
-      # TODO: Refine this.
-      raise NotImplementedError()
+    if self.max_num_pages_per_seq > self.total_num_pages:
+      raise ValueError(
+          f'{self.max_num_pages_per_seq=} must be <= {self.total_num_pages=}'
+      )
 
   @classmethod
   def attrs_from_tree(
@@ -189,7 +255,9 @@ class DecodeState:
 
   @property
   def max_num_pages_per_seq(self) -> int:
-    return (self.max_seq_len - 1 + self.page_size - 1) // self.page_size
+    return max_num_pages_per_seq(
+        self.max_seq_len, self.page_size, self.window_size
+    )
 
   @property
   def total_num_pages(self) -> int:
@@ -200,12 +268,16 @@ class DecodeState:
     return self.pages.shape[1]
 
   @property
-  def n_kv_heads(self) -> int:
+  def num_kv_heads(self) -> int:
     return self.pages.shape[-2] // 2
 
   @property
   def padded_per_head_dim(self) -> int:
     return self.pages.shape[-1]
+
+  @property
+  def dtype(self) -> jax.typing.DTypeLike:
+    return self.pages.dtype
 
   @functools.cached_property
   def num_pages(self) -> jax.Array:
@@ -242,7 +314,7 @@ class DecodeState:
       self, idx: jax.typing.ArrayLike, per_head_dim: int = 0
   ) -> np.ndarray:
     """Returns the kv for the given idx."""
-    # Return shape in [kv_len, n_kv_heads * 2, per_head_dim]
+    # Return shape in [kv_len, num_kv_heads * 2, per_head_dim]
     pages = self.pages[self.page_indices[idx]]
     context = einops.rearrange(pages, 'n p ... -> (n p) ...')
     if per_head_dim > 0:
@@ -253,6 +325,51 @@ class DecodeState:
     return [
         self.kv_np(i, per_head_dim=per_head_dim) for i in range(self.batch_size)
     ]
+
+  @functools.cached_property
+  def max_available_kv_lens(self) -> jax.Array:
+    kv_lens = self.kv_lens
+    if self.window_size is not None:
+      kv_lens -= (
+          jnp.maximum(kv_lens - self.window_size, 0)
+          // self.page_size
+          * self.page_size
+      )
+    return self.page_size * self.max_num_pages_per_seq - kv_lens
+
+  @jax.named_call
+  def release_for_window(self) -> Self:
+    """Releases the decode state for local attention."""
+    if self.window_size is None:
+      return self
+    num_pages_to_release = (
+        jnp.maximum(self.kv_lens - self.window_size, 0) // self.page_size
+    )
+    page_indices_irows = jnp.arange(self.batch_size)[:, None]
+    page_indices_icols = (
+        jnp.arange(self.max_num_pages_per_seq) + num_pages_to_release[:, None]
+    )
+    updated_page_indices = self.page_indices[
+        page_indices_irows, page_indices_icols
+    ]
+    release_helper = RaggedArray(
+        data=jax.lax.empty((self.total_num_pages,), dtype=jnp.int32),
+        lens=num_pages_to_release,
+    )
+    released_page_indices = self.page_indices[
+        release_helper.row_ids, release_helper.intra_offset
+    ]
+    updated_available_page_indices = self.available_page_indices.at[
+        jnp.arange(self.total_num_pages) + self.num_available_pages
+    ].set(released_page_indices, mode='drop')
+    return dataclasses.replace(
+        self,
+        page_indices=updated_page_indices,
+        available_page_indices=updated_available_page_indices,
+        num_available_pages=self.num_available_pages
+        + release_helper.total_length,
+        kv_lens=self.kv_lens - num_pages_to_release * self.page_size,
+    )
 
   @jax.named_call
   def allocate(self, q_lens: jax.Array) -> Self:
@@ -288,14 +405,9 @@ class DecodeState:
         num_available_pages=updated_num_available_pages,
     )
 
-  def release_for_window(self) -> Self:
-    """Releases the decode state for local attention."""
-    raise NotImplementedError()
-
   @jax.named_call
   def release(self, should_release: jax.Array) -> Self:
     """Releases the decode state."""
-
     updated_kv_lens = jnp.where(should_release, 0, self.kv_lens)
     page_indices_to_release = RaggedArray(
         data=jax.lax.empty((self.total_num_pages,), dtype=jnp.int32),
@@ -370,7 +482,7 @@ class DecodeState:
         page_manage_cache is None
         or self.page_manage_key not in page_manage_cache
     ):
-      decode_state = self.allocate(q.lens)
+      decode_state = self.release_for_window().allocate(q.lens)
       if page_manage_cache is not None:
         page_manage_cache[self.page_manage_key] = decode_state
     else:
@@ -391,12 +503,34 @@ class DecodeState:
           sliding_window=self.window_size,
       )
     else:
+      num_kv_pages_per_block = self.num_kv_pages_per_block
+      num_queries_per_block = self.num_queries_per_block
+      if num_kv_pages_per_block is None or num_queries_per_block is None:
+        head_partition_size = sharding.get_partition_size(self.head_partition)
+        num_kv_heads_per_shard = self.num_kv_heads // head_partition_size
+        num_q_heads_per_shard = q.data.shape[1] // head_partition_size
+        num_kv_pages_per_block, num_queries_per_block = autotune_block_sizes(
+            num_kv_heads=num_kv_heads_per_shard,
+            num_q_heads=num_q_heads_per_shard,
+            page_size=self.page_size,
+            max_seq_len=self.max_seq_len,
+            per_head_dim=self.padded_per_head_dim,
+            window_size=self.window_size,
+            dtype=self.dtype,
+            max_num_issue_tokens=q.capacity,
+        )
+        logging.info(
+            'Autotuned num_kv_pages_per_block: %d, num_queries_per_block: %d',
+            num_kv_pages_per_block,
+            num_queries_per_block,
+        )
       rpa_fn = jax.shard_map(
           functools.partial(
               ragged_paged_attention.ragged_paged_attention,
-              sliding_window=self.window_size,
-              num_kv_pages_per_block=self.num_kv_pages_per_block,
-              num_queries_per_block=self.num_queries_per_block,
+              # RPA kernel's window size includes self
+              sliding_window=self.window_size + 1 if self.window_size else None,
+              num_kv_pages_per_block=num_kv_pages_per_block,
+              num_queries_per_block=num_queries_per_block,
           ),
           mesh=js.get_abstract_mesh(),
           in_specs=(
@@ -512,14 +646,21 @@ class SamplingState:
 
   @functools.cached_property
   def desired_issue_lens(self) -> jax.Array:
+    attrs = DecodeState.attrs_from_tree(
+        self.decode_state, ['max_available_kv_lens']
+    )
+    max_available_kv_lens = jnp.min(jnp.array(attrs['max_available_kv_lens']))
     return jnp.where(
         self.has_ended,
         0,
-        jnp.maximum(
-            self.input_lens
-            - jnp.astype(self.max_decode_steps <= 0, jnp.int32)
-            - self.position,
-            1,
+        jnp.minimum(
+            max_available_kv_lens,
+            jnp.maximum(
+                self.input_lens
+                - jnp.astype(self.max_decode_steps <= 0, jnp.int32)
+                - self.position,
+                1,
+            ),
         ),
     )
 
@@ -678,36 +819,34 @@ class SamplingState:
       self, ragged_output_tokens: common.RaggedArray, **kwargs: jax.Array
   ) -> Self:
     """Updates the sampling state with the ragged output tokens."""
-    # User must guarantee ragged_output_tokens is not empty.
     assert self.batch_size == ragged_output_tokens.batch_size
-
-    # maximum in fact would not take effect since we guarantee the first row
-    # has token.
-    last_token_indices = jnp.maximum(
-        ragged_output_tokens.row_starts_with_end[1:] - 1, 0
-    )
     updated_position = self.position + ragged_output_tokens.lens
-    output_position = jnp.where(
-        (ragged_output_tokens.lens > 0) & (updated_position >= self.input_lens),
-        updated_position,
-        self.max_seq_len,
+
+    safe_row_ids = jnp.where(
+        jnp.arange(ragged_output_tokens.capacity)
+        < ragged_output_tokens.total_length,
+        ragged_output_tokens.row_ids,
+        ragged_output_tokens.batch_size,
+    )
+    intra_offset = (
+        self.position[ragged_output_tokens.row_ids]
+        + ragged_output_tokens.intra_offset
+        + 1
     )
 
-    batch_arange = jnp.arange(self.batch_size)
-    updated_tokens = self.tokens.at[batch_arange, output_position].set(
-        ragged_output_tokens.data[last_token_indices], mode='drop'
+    updated_tokens = self.tokens.at[safe_row_ids, intra_offset].set(
+        ragged_output_tokens.data, mode='drop'
     )
 
     extra_replacements = {}
     if (token_logprobs := kwargs.get('token_logprobs')) is not None:
       extra_replacements['token_logprobs'] = self.token_logprobs.at[
-          batch_arange, output_position
-      ].set(token_logprobs[last_token_indices], mode='drop')
+          safe_row_ids, intra_offset
+      ].set(token_logprobs, mode='drop')
     if (token_scores := kwargs.get('token_scores')) is not None:
-      # TODO: Figure out input scoring.
       extra_replacements['token_scores'] = self.token_scores.at[
-          batch_arange, output_position
-      ].set(token_scores[last_token_indices], mode='drop')
+          safe_row_ids, intra_offset
+      ].set(token_scores, mode='drop')
 
     return dataclasses.replace(
         self,
@@ -802,24 +941,20 @@ class SamplingState:
         key, logits, temperature=temperature, top_k=top_k, top_p=top_p
     )
 
-    # TODO: Correct output_tokens if it is input. This is currently done
-    # by update_with_ragged_output, but ideally we should do it here to make
-    # input scores correct.
-    scoring_follows_sampling = (
-        (temperature == scoring_temperature)
-        & (top_k == scoring_top_k)
-        & (top_p == scoring_top_p)
+    next_tokens = self.tokens[
+        ragged_issue_tokens.row_ids, segment_positions + 1
+    ]
+    output_tokens = jnp.where(
+        segment_positions + 1 >= self.input_lens[ragged_issue_tokens.row_ids],
+        output_tokens,
+        next_tokens,
     )
-    output_scores = jax.lax.cond(
-        scoring_follows_sampling,
-        lambda: output_logprobs,
-        lambda: sampling_lib.compute_log_likelihood(
-            logits,
-            output_tokens,
-            temperature=scoring_temperature,
-            top_k=scoring_top_k,
-            top_p=scoring_top_p,
-        ),
+    output_scores = sampling_lib.compute_log_likelihood(
+        logits,
+        output_tokens,
+        temperature=scoring_temperature,
+        top_k=scoring_top_k,
+        top_p=scoring_top_p,
     )
 
     sampling_state = self.update_with_ragged_output(

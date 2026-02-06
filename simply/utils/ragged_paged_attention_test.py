@@ -13,7 +13,6 @@
 # limitations under the License.
 import dataclasses
 import functools
-import unittest
 
 from absl.testing import absltest
 import einops
@@ -156,9 +155,9 @@ class DecodeStateTest(absltest.TestCase):
         ]),
     )
 
-  @unittest.skipIf(
-      tuned_block_sizes.get_tpu_version() < 4, 'Requires TPU v4 or higher')
   def test_update_decode_state_and_compute_attn(self):
+    if tuned_block_sizes.get_tpu_version() < 4:
+      self.skipTest('Requires TPU v4 or higher')
     total_num_pages = 6
     page_size = 3
     max_seq_len = total_num_pages * page_size + 1
@@ -228,6 +227,57 @@ class DecodeStateTest(absltest.TestCase):
         functools.partial(np.testing.assert_allclose, atol=0.005),
         RaggedArray(ragged_attn_out, ragged_q.lens).to_numpy_list(),
         expected_attn_out_list,
+    )
+
+  def test_autotune_block_sizes(self):
+    num_kv_pages_per_block, num_queries_per_block = rpa.autotune_block_sizes(
+        num_kv_heads=2,
+        num_q_heads=4,
+        page_size=128,
+        max_seq_len=16 * 1024,
+        per_head_dim=128,
+        window_size=None,
+        dtype='bfloat16',
+    )
+    self.assertEqual(num_kv_pages_per_block, 16)
+    self.assertEqual(num_queries_per_block, 32)
+
+    num_kv_pages_per_block, num_queries_per_block = rpa.autotune_block_sizes(
+        num_kv_heads=2,
+        num_q_heads=4,
+        page_size=128,
+        max_seq_len=16 * 1024,
+        per_head_dim=128,
+        window_size=127,
+        dtype='bfloat16',
+    )
+    self.assertEqual(num_kv_pages_per_block, 2)
+    self.assertEqual(num_queries_per_block, 32)
+
+  def test_release_for_window(self):
+    config = rpa.DecodeStateConfig(
+        total_num_pages=9,
+        page_size=4,
+        n_kv_heads=1,
+        per_head_dim=2,
+        batch_size=3,
+        dtype='float32',
+        window_size=5,
+        max_seq_len=10000,
+    )
+    ds = config.init().allocate(jnp.array([3, 8, 10]))
+    self.assertEqual(ds.max_num_pages_per_seq, 3)
+    np.testing.assert_array_equal(ds.max_available_kv_lens, np.array([9, 4, 6]))
+    ds = ds.release_for_window()
+    np.testing.assert_array_equal(ds.max_available_kv_lens, np.array([9, 4, 6]))
+    np.testing.assert_array_equal(ds.kv_lens, np.array([3, 8, 6]))
+    jax.tree_util.tree_map(
+        np.testing.assert_array_equal,
+        ds.page_indices_nplist,
+        [np.array([0]), np.array([1, 2]), np.array([4, 5])],
+    )
+    np.testing.assert_array_equal(
+        ds.available_page_indices_np, np.array([6, 7, 8, 3])
     )
 
 
@@ -346,23 +396,23 @@ class SamplingStateTest(absltest.TestCase):
             dict(
                 index=0,
                 input_len=tokens.lens[0],
-                tokens=np.array([1, 2]),
-                logprobs=np.zeros(2),
-                scores=np.zeros(2),
+                tokens=np.array([1, -1]),
+                logprobs=np.array([0, 1]),
+                scores=np.array([0, 1]),
             ),
             dict(
                 index=1,
                 input_len=tokens.lens[1],
-                tokens=np.array([4, 5, 6, 7, 8, 9, 10, -10]),
-                logprobs=np.pad(np.zeros(7), (0, 1), constant_values=1),
-                scores=np.pad(np.zeros(7), (0, 1), constant_values=1),
+                tokens=np.array([4, 5, 6, -6, -7, -8, -9, -10]),
+                logprobs=np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+                scores=np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
             ),
         ],
     )
 
-  @unittest.skipIf(
-      tuned_block_sizes.get_tpu_version() < 4, 'Requires TPU v4 or higher')
   def test_continue_decode(self):
+    if tuned_block_sizes.get_tpu_version() < 4:
+      self.skipTest('Requires TPU v4 or higher')
     max_seq_len = 8
     batch_size = 2
     vocab_size = 10
@@ -482,12 +532,19 @@ class SamplingStateTest(absltest.TestCase):
     for i in range(batch_size):
       input_len = outputs[i]['input_len']
       self.assertEqual(input_len, tokens.lens[i])
-      output_slice = slice(input_len, len(outputs[i]['tokens']))
+      np.testing.assert_array_equal(
+          sampling_state.tokens[i][:input_len], tokens.row(i)
+      )
+      length = len(outputs[i]['tokens'])
 
       np.testing.assert_allclose(
-          outputs[i]['logprobs'][output_slice],
-          logprobs[i][output_slice],
+          outputs[i]['logprobs'][input_len:length],
+          logprobs[i][input_len:length],
           rtol=5e-3,
+          atol=1e-10,
+      )
+      np.testing.assert_allclose(
+          outputs[i]['scores'][1:], logprobs[i][1:length], rtol=5e-3, atol=1e-10
       )
 
 

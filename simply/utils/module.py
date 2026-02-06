@@ -427,6 +427,9 @@ class EmbeddingLinear(SimplyModule):
           dtype=self.weight_dtype,
           dim_annotation='.i',
       )
+      params[self.embed_name] = sharding_lib.with_sharding_constraint(
+          params[self.embed_name], self.weight_partition
+      )
     return params
 
   def embed(self, params: PyTree, x: Array) -> Array:

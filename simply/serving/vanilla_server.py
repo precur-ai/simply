@@ -326,7 +326,9 @@ async def main(argv: Sequence[str]) -> None:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
-  sharding.set_mesh(mesh_shape)
+  sharding.set_mesh(
+      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
+  )
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
   if vocab_name := _VOCAB_NAME.value:

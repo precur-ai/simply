@@ -1,4 +1,4 @@
-# Copyright 2024 The Simply Authors
+# Copyright 2025 The Simply Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ from typing import ClassVar
 
 import jax.numpy as jnp
 
+from simply.utils import common
 from simply.utils import registry
 
 
@@ -31,11 +32,13 @@ class PositionEncodingRegistry(registry.RootRegistry):
 class PositionEncodingConfig:
   """Base class for position encoding configurations."""
 
-  def apply(self, embedding_mat, segment_positions=None):
+  def apply(
+      self, embedding_mat: common.Array,
+      segment_positions: common.Array | None = None):
     """Apply position encoding to embedding matrix.
 
     Args:
-      embedding_mat: Input tensor of shape 
+      embedding_mat: Input tensor of shape
         [batch, seq_len, num_heads, head_dim].
       segment_positions: Optional position indices of shape [batch, seq_len].
 
@@ -62,11 +65,15 @@ class RoPE(PositionEncodingConfig):
   max_timescale: int = 10_000
   scale_factor: float = 1.0
 
-  def apply(self, embedding_mat, segment_positions=None):
+  def apply(
+      self,
+      embedding_mat: common.Array,
+      segment_positions: common.Array | None = None,
+  ):
     """Apply rotary positional embedding.
 
     Args:
-      embedding_mat: Input tensor of shape 
+      embedding_mat: Input tensor of shape
         [batch, seq_len, num_heads, head_dim].
       segment_positions: Optional position indices of shape [batch, seq_len].
 
@@ -100,5 +107,4 @@ class RoPE(PositionEncodingConfig):
     second_part = second_half * cos + first_half * sin
     embedding_mat = jnp.concatenate([first_part, second_part], axis=-1)
     # Convert back to original dtype.
-    embedding_mat = jnp.asarray(embedding_mat, embedding_dtype)
-    return embedding_mat
+    return jnp.asarray(embedding_mat, embedding_dtype)

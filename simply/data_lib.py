@@ -11,30 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Data pipeline for LLM training based on grain.
+"""Data pipeline based on grain.
 
 Usage:
-  # In experiment config, set dataset_config to one of:
+  # In experiment config, set dataset to one of:
 
-  # Option 1: String shorthand (looks up factory in DatasetRegistry)
-  dataset_config = 'my_dataset_factory'
+  # Option 1: String shorthand (looks up factory in DatasetConfigRegistry)
+  dataset = 'my_dataset'
 
-  # Option 2: TFDS dataset
-  dataset_config = DatasetConfig(
-    source=TFDSSourceConfig(name='c4:3.0.1', split='train[:90%]'),
+  # Option 2: DatasetConfig
+  dataset = DatasetConfig(
+    source=TFDSSource(name='c4:3.0.1', split='train[:90%]'),
   )
 
-  # Option 3: Mixture with weights
-  dataset_config = MixtureConfig(datasets=(
+  # Option 3: MixtureConfig
+  dataset = MixtureConfig(datasets=(
     (DatasetConfig(source='dataset_a'), 0.7),
     ('dataset_b', 0.3),  # String shorthand also works
   ))
 
   # Create iterator
   dataset = create_iter_dataset(experiment_config, training=True)
-  for batch in dataset:
+  for batch in iter(dataset):
     # batch has: decoder_input_tokens, decoder_target_tokens,
-    decoder_loss_weights
+    # decoder_loss_weights
     ...
 """
 
@@ -42,10 +42,9 @@ Usage:
 from collections.abc import Mapping, Sequence
 import dataclasses
 import functools
-import glob
 import json
 import os
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 from absl import logging
 from etils import epath
@@ -60,7 +59,6 @@ import simply.utils.lm_format as lm_format_lib
 DATASETS_DIR = os.getenv('SIMPLY_DATASETS', os.path.expanduser('~/.cache/simply/datasets/'))
 VOCABS_DIR = os.getenv('SIMPLY_VOCABS', os.path.expanduser('~/.cache/simply/vocabs/'))
 
-
 ################################################################################
 # Tokenizers / vocabularies.
 
@@ -73,10 +71,12 @@ OPENMIX_V3_100864_V1_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r10
 OPENMIX_V3_100864_V2_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r100-v2-08312024.model')
 GEMMA2_VOCAB = os.path.join(VOCABS_DIR, 'gemma2_tokenizer.model')
 GEMMA3_VOCAB = os.path.join(VOCABS_DIR, 'gemma3_cleaned_262144_v2.spiece.model')
-QWEN2P5_VOCAB = os.path.join(VOCABS_DIR, 'Qwen2.5-32B')
-QWQ_VOCAB = os.path.join(VOCABS_DIR, 'QwQ-32B')
-DEEPSEEK_R1_DISTILL_QWEN_VOCAB = os.path.join(VOCABS_DIR, 'DeepSeek-R1-Distill-Qwen-32B')
-QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3-32B')
+QWEN2P5_VOCAB = os.path.join(VOCABS_DIR, 'Qwen2.5')
+QWQ_VOCAB = os.path.join(VOCABS_DIR, 'QwQ')
+DEEPSEEK_R1_DISTILL_QWEN_VOCAB = os.path.join(
+    VOCABS_DIR, 'DeepSeek-R1-Distill-Qwen'
+)
+QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3')
 
 
 OPENMIX_V1_VOCABS = [
@@ -88,9 +88,6 @@ OPENMIX_V3_VOCABS = [
     ('vb100864_v2_openmix_v3', OPENMIX_V3_100864_V2_VOCAB)]
 GEMMA2_VOCABS = [('vb256128_gemma2', GEMMA2_VOCAB)]
 GEMMA3_VOCABS = [('vb262144_gemma3', GEMMA3_VOCAB)]
-T5_CC_VOCABS = [
-    ('vb32000_t5_cc',
-     'gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model')]
 
 HF_VOCABS = [
     ('Qwen2.5', QWEN2P5_VOCAB),
@@ -98,8 +95,6 @@ HF_VOCABS = [
     ('DeepSeek-R1-Distill-Qwen', DEEPSEEK_R1_DISTILL_QWEN_VOCAB),
     ('Qwen3', QWEN3_VOCAB),
 ]
-
-tokenization.TokenizerRegistry.reset()
 
 
 def register_spm_vocabs():
@@ -110,7 +105,11 @@ def register_spm_vocabs():
     # Use default argument to capture loop variables correctly.
     tokenization.TokenizerRegistry.register(
         lambda vocab_path=vocab_path: tokenization.SimplySentencePieceVocab(
-            vocab_path), name=name)
+            vocab_path
+        ),
+        name=name,
+    )
+
 
 register_spm_vocabs()
 
@@ -119,7 +118,9 @@ def register_hf_vocabs():
   for name, vocab_path in HF_VOCABS:
     tokenization.TokenizerRegistry.register(
         lambda vocab_path=vocab_path: tokenization.HuggingFaceVocab(vocab_path),
-        name=name)
+        name=name,
+    )
+
 
 register_hf_vocabs()
 
@@ -132,13 +133,22 @@ register_hf_vocabs()
 class DataSourceRegistry(registry.RootRegistry):
   """Registry for data sources (lazy-evaluated)."""
 
-  namespace: ClassVar[str] = 'datasource_grain'
+  namespace: ClassVar[str] = 'DataSource'
 
 
-class DataConfigRegistry(registry.RootRegistry):
+class DatasetConfigRegistry(registry.RootRegistry):
   """Registry for data configuration dataclasses."""
 
-  namespace: ClassVar[str] = 'dataconfig_grain'
+  namespace: ClassVar[str] = 'DatasetConfig'
+
+
+class SimpleDataSource(Protocol):
+
+  def __len__(self):
+    ...
+
+  def __getitem__(self, index: int):
+    ...
 
 
 ################################################################################
@@ -146,10 +156,10 @@ class DataConfigRegistry(registry.RootRegistry):
 ################################################################################
 
 
-@DataConfigRegistry.register
+@DataSourceRegistry.register
 @dataclasses.dataclass(frozen=True)
-class TFDSSourceConfig:
-  """Configuration for a TensorFlow Datasets (TFDS) data source.
+class TFDSSource:
+  """TFDS data source with lazy loading.
 
   Use this when you need to specify TFDS-specific options like split.
 
@@ -159,18 +169,29 @@ class TFDSSourceConfig:
       'train[10%:20%]', 'validation'.
 
   Example:
-    tfds_config = TFDSSourceConfig(name='c4:3.0.1', split='train[:1000]')
-    dataset_config = DatasetConfig(source=tfds_config)
+    source = TFDSSource(name='c4:3.0.1', split='train[:1000]')
+    dataset_config = DatasetConfig(source=source)
   """
 
   name: str
   split: str = 'train'
 
+  @functools.cached_property
+  def _source(self):
+    import tensorflow_datasets as tfds  # pylint: disable=g-import-not-at-top
+    return tfds.data_source(self.name, split=self.split)
 
-@DataConfigRegistry.register
+  def __len__(self) -> int:
+    return len(self._source)
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    return self._source[index]
+
+
+@DataSourceRegistry.register
 @dataclasses.dataclass(frozen=True)
-class HFDatasetSourceConfig:
-  """Configuration for a HuggingFace Datasets data source.
+class HFSource:
+  """HuggingFace data source with lazy loading.
 
   Use this for HuggingFace datasets from the Hub or local files.
 
@@ -180,11 +201,11 @@ class HFDatasetSourceConfig:
     subset: Optional subset/configuration name (e.g., 'wikitext-2-raw-v1').
 
   Example:
-    hf_config = HFDatasetSourceConfig(name='imdb', split='train[:1000]')
-    dataset_config = DatasetConfig(source=hf_config)
+    source = HFSource(name='imdb', split='train[:1000]')
+    dataset_config = DatasetConfig(source=source)
 
     # With subset/configuration
-    hf_config = HFDatasetSourceConfig(
+    source = HFSource(
       name='wikitext',
       subset='wikitext-2-raw-v1',
       split='train',
@@ -195,63 +216,100 @@ class HFDatasetSourceConfig:
   split: str = 'train'
   subset: str | None = None
 
+  @functools.cached_property
+  def _source(self):
+    import datasets  # pylint: disable=g-import-not-at-top
 
-@DataConfigRegistry.register
+    return datasets.load_dataset(self.name, name=self.subset, split=self.split)
+
+  def __len__(self) -> int:
+    return len(self._source)
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    return self._source[index]
+
+
+@DataSourceRegistry.register
 @dataclasses.dataclass(frozen=True)
-class ArrayRecordSourceConfig:
-  """Configuration for ArrayRecord data source.
+class ArrayRecordSource:
+  """ArrayRecord data source with glob expansion and lazy loading.
 
   ArrayRecord is Google's efficient file format for random access to large
   datasets. See: https://github.com/google/array_record
 
   Attributes:
-    paths: Sequence of file paths or glob patterns to ArrayRecord files.
-      Examples: ('/data/train.arrayrecord',) or ('/data/train-*.arrayrecord',)
+    paths: File path(s) or glob pattern(s) to ArrayRecord files. Can be a single
+      string or a sequence of strings. If a single string is provided, it is
+      automatically converted to a single-element tuple.
+      Examples: '/data/train.arrayrecord' or ('/data/train-*.arrayrecord',)
 
   Example:
-    # Single file
-    config = ArrayRecordSourceConfig(paths=('/data/train.arrayrecord',))
+    # Single file (string)
+    source = ArrayRecordSource(paths='/data/train.arrayrecord')
+
+    # Single file (tuple)
+    source = ArrayRecordSource(paths=('/data/train.arrayrecord',))
 
     # Multiple shards with glob
-    config = ArrayRecordSourceConfig(
-        paths=('/data/train-00000-of-00010.arrayrecord',
-               '/data/train-00001-of-00010.arrayrecord',)
-    )
+    source = ArrayRecordSource(paths=(
+        '/data1/train-*.arrayrecord',
+        '/data2/train-*.arrayrecord',
+        '/data3/train-*.arrayrecord',
+    ))
 
     # In DatasetConfig
-    dataset_config = DatasetConfig(
-        source=ArrayRecordSourceConfig(paths=('/data/pile/*.arrayrecord',)),
+    dataset = DatasetConfig(
+        source=ArrayRecordSource(paths=('/data/pile/*.arrayrecord',)),
         lm_format_name='Pretrain',
     )
   """
 
-  paths: Sequence[str]
+  paths: str | Sequence[str]
+
+  @functools.cached_property
+  def _source(self):
+    """Lazily expands paths and creates a Grain ArrayRecordDataSource."""
+    expanded_paths = []
+    paths = (self.paths,) if isinstance(self.paths, str) else self.paths
+    for pattern in paths:
+      import glob
+      matches = glob.glob(pattern)
+      if matches:
+        expanded_paths.extend(sorted(matches))
+      else:
+        expanded_paths.append(pattern)
+    return grain.ArrayRecordDataSource(expanded_paths)
+
+  def __len__(self) -> int:
+    return len(self._source)
+
+  def __getitem__(self, index: int):
+    return self._source[index]
 
 
-@DataConfigRegistry.register
+@DatasetConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
 class DatasetConfig:
   """Configuration for a single dataset.
 
   The data source can be specified in four ways:
   1. source_name (str): Looks up in DataSourceRegistry
-  2. source (TFDSSourceConfig): Uses TFDS with specified name and split
-  3. source (HFDatasetSourceConfig): Uses HuggingFace datasets
-  4. source (ArrayRecordSourceConfig): Uses ArrayRecord files directly
+  2. source (TFDSSource): Uses TFDS with specified name and split
+  3. source (HFSource): Uses HuggingFace datasets
+  4. source (ArrayRecordSource): Uses ArrayRecord files directly
 
   Attributes:
-    source: Data source - either a string (registry name) or config object.
-    lm_format_name: Controls tokenization/formatting:
-      - None: Raw - skip tokenization, data passed through as-is (only
-        batch/prefetch applied). Use for custom processing outside pipeline.
-      - 'Pretrain': Pretraining - TokenizeTransform + NextTokenPredTransform.
-      - 'SimplyV1Chat', etc.: Chat format - ChatFormatTransform with role
-        markers + NextTokenPredTransform.
-    packing: Packing method for creating fixed-length sequences:
-      - 'concat_split': Concatenate and split (best throughput, for pretraining)
-      - 'first_fit': Bin packing preserving boundaries (for chat/SFT)
-      - 'pad_or_truncate': Simple pad/truncate (for validation)
-      - 'none': No packing (for raw data)
+    source: Data source - either a string (registry name) or source object.
+    lm_format_name: Controls tokenization/formatting: - None: Raw - skip
+      tokenization, data passed through as-is (only batch/prefetch applied). Use
+      for custom processing outside the pipeline. - 'Pretrain': Pretraining -
+      TokenizeTransform + NextTokenPredTransform. - 'SimplyV1Chat', etc.: Chat
+      format - ChatFormatTransform with role markers + NextTokenPredTransform.
+    packing: Packing method for creating fixed-length sequences: -
+      'concat_split': Concatenate and split (best throughput, for pretraining) -
+      'first_fit': Bin packing preserving boundaries (for chat/SFT) -
+      'pad_or_truncate': Simple pad/truncate (for validation) - 'none': No
+      packing (for raw data)
     data_key: Key in the example dict containing data to process.
     tokenizer_name: Tokenizer to use from TokenizerRegistry. If None, uses the
       experiment's vocab_name.
@@ -265,7 +323,7 @@ class DatasetConfig:
   Example:
     # Pretraining with TFDS
     config = DatasetConfig(
-      source=TFDSSourceConfig(name='c4:3.0.1', split='train[:90%]'),
+      source=TFDSSource(name='c4:3.0.1', split='train[:90%]'),
       lm_format_name='Pretrain',
       packing='concat_split',
     )
@@ -287,22 +345,17 @@ class DatasetConfig:
     )
   """
 
-  source: (
-      str
-      | TFDSSourceConfig
-      | HFDatasetSourceConfig
-      | ArrayRecordSourceConfig
-  )
+  source: str | TFDSSource | HFSource | ArrayRecordSource
   lm_format_name: str | None = 'Pretrain'  # None = raw, 'Pretrain' = tokenize
   packing: str = 'concat_split'
   data_key: str = 'text'
   tokenizer_name: str | None = None  # None = use config.vocab_name
   add_eos: bool = True
-  add_bos: bool = False
+  add_bos: bool = True
   trainable_roles: tuple[str, ...] | None = None  # None = all roles have loss.
 
 
-@DataConfigRegistry.register
+@DatasetConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
 class MixtureConfig:
   """Configuration for a mixture of datasets.
@@ -322,7 +375,7 @@ class MixtureConfig:
       (default), mix examples first then pack together.
 
   Example:
-    # Mix then pack (default) - packed sequences may span datasets.
+    # Mix before pack (default) - packed sequences may span datasets.
     mixture = MixtureConfig(
       datasets=(
         (DatasetConfig(source='dataset_a'), 0.7),
@@ -330,7 +383,7 @@ class MixtureConfig:
       ),
     )
 
-    # Pack then mix - each packed sequence from single dataset.
+    # Pack before mix - each packed sequence from single dataset.
     mixture = MixtureConfig(
       datasets=(
         (DatasetConfig(source='dataset_a'), 0.7),
@@ -340,7 +393,7 @@ class MixtureConfig:
     )
   """
 
-  datasets: Sequence[tuple[DatasetConfig, float]]
+  datasets: Sequence[tuple[str | DatasetConfig, float]]
   pack_before_mix: bool = False
 
   def __post_init__(self):
@@ -356,7 +409,7 @@ class MixtureConfig:
 ################################################################################
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:gsm8k_train')
+@functools.partial(DataSourceRegistry.register, name='simply:gsm8k_train')
 @dataclasses.dataclass(frozen=True)
 class GSM8KSource:
   """GSM8K dataset source with lazy loading."""
@@ -384,7 +437,7 @@ class GSM8KSource:
     return self._examples[index]
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:gsm8k_test')
+@functools.partial(DataSourceRegistry.register, name='simply:gsm8k_test')
 @dataclasses.dataclass(frozen=True)
 class GSM8KTestSource(GSM8KSource):
   """GSM8K test split."""
@@ -392,9 +445,7 @@ class GSM8KTestSource(GSM8KSource):
   split: str = 'test'
 
 
-@functools.partial(
-    DataSourceRegistry.register, name='simply_json:simple_qa_test'
-)
+@functools.partial(DataSourceRegistry.register, name='simply:simple_qa_test')
 @dataclasses.dataclass(frozen=True)
 class SimpleQASource:
   """Simple QA dataset source with lazy loading."""
@@ -419,7 +470,7 @@ class SimpleQASource:
     return self._examples[index]
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:simple_qa_num')
+@functools.partial(DataSourceRegistry.register, name='simply:simple_qa_num')
 @dataclasses.dataclass(frozen=True)
 class SimpleQANumSource(SimpleQASource):
   """Simple QA dataset with only number-only answers."""
@@ -429,7 +480,7 @@ class SimpleQANumSource(SimpleQASource):
   )
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:mmlu_test')
+@functools.partial(DataSourceRegistry.register, name='simply:mmlu_test')
 @dataclasses.dataclass(frozen=True)
 class MMLUSource:
   """MMLU dataset source with lazy loading."""
@@ -456,7 +507,7 @@ class MMLUSource:
     return self._examples[index]
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:dsr40k_train')
+@functools.partial(DataSourceRegistry.register, name='simply:dsr40k_train')
 @dataclasses.dataclass(frozen=True)
 class DeepScaleRSource:
   """DeepScaleR dataset source with lazy loading."""
@@ -467,6 +518,7 @@ class DeepScaleRSource:
 
   @functools.cached_property
   def _examples(self) -> list[dict[str, Any]]:
+    """Lazily loads and caches examples."""
     with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
@@ -487,7 +539,7 @@ class DeepScaleRSource:
     return self._examples[index]
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:aime24')
+@functools.partial(DataSourceRegistry.register, name='simply:aime24')
 @dataclasses.dataclass(frozen=True)
 class AIME24Source:
   """AIME 2024 dataset source with lazy loading."""
@@ -499,6 +551,7 @@ class AIME24Source:
 
   @functools.cached_property
   def _examples(self) -> list[dict[str, Any]]:
+    """Lazily loads and caches examples."""
     with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
@@ -520,7 +573,7 @@ class AIME24Source:
     return self._examples[index]
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:aime25')
+@functools.partial(DataSourceRegistry.register, name='simply:aime25')
 @dataclasses.dataclass(frozen=True)
 class AIME25Source(AIME24Source):
   """AIME 2025 dataset source."""
@@ -528,7 +581,7 @@ class AIME25Source(AIME24Source):
   year: int = 2025
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:math500_test')
+@functools.partial(DataSourceRegistry.register, name='simply:math500_test')
 @dataclasses.dataclass(frozen=True)
 class MATH500Source:
   """MATH500 test set source with lazy loading."""
@@ -539,6 +592,7 @@ class MATH500Source:
 
   @functools.cached_property
   def _examples(self) -> list[dict[str, Any]]:
+    """Lazily loads and caches examples from the MATH500 test set."""
     with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
@@ -562,7 +616,7 @@ class MATH500Source:
     return self._examples[index]
 
 
-@functools.partial(DataSourceRegistry.register, name='simply_json:gpqa_diamond')
+@functools.partial(DataSourceRegistry.register, name='simply:gpqa_diamond')
 @dataclasses.dataclass(frozen=True)
 class GPQADiamondSource:
   """GPQA-Diamond dataset source with lazy loading."""
@@ -573,6 +627,7 @@ class GPQADiamondSource:
 
   @functools.cached_property
   def _examples(self) -> list[dict[str, Any]]:
+    """Lazily loads and caches examples from the GPQA-Diamond dataset."""
     with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
@@ -601,12 +656,27 @@ def _register_gsm8k_variants():
   for num_examples in [4, 32, 128]:
     DataSourceRegistry.register_value(
         GSM8KSource(start_index=0, end_index=num_examples),
-        name=f'simply_json:gsm8k_train{num_examples}',
+        name=f'simply:gsm8k_train{num_examples}',
     )
 
 
 _register_gsm8k_variants()
 
+
+################################################################################
+# Pretraining data sources.
+################################################################################
+
+
+def pt_dataset_v1(source):
+  return DatasetConfig(
+      source=source,
+      data_key='text',
+      packing=PACKING_CONCAT_SPLIT,
+      add_eos=True,
+      add_bos=True,
+      lm_format_name='Pretrain',
+  )
 
 ################################################################################
 # Grain transforms.
@@ -650,12 +720,12 @@ class TFExampleDeserializeTransform(grain.MapTransform):
     if isinstance(features, Mapping):
       return dict(features)
 
-    # Parse TFExample proto using tensorflow_datasets proto definitions.
+    # Parse TFExample proto using tensorflow proto definitions.
     # This avoids requiring full tensorflow installation.
     # pylint: disable=g-import-not-at-top
-    from tensorflow_datasets.proto import tf_example_pb2
+    import tensorflow as tf
 
-    example = tf_example_pb2.Example()
+    example = tf.train.Example()
     example.ParseFromString(features)
 
     result = {}
@@ -824,7 +894,7 @@ class TruncateTransform(grain.MapTransform):
     for key, value in features.items():
       if isinstance(value, np.ndarray) and value.ndim == 1:
         # Left truncation: keep the end (most recent tokens).
-        result[key] = value[-self.seq_len:]
+        result[key] = value[-self.seq_len :]
       else:
         result[key] = value
     return result
@@ -850,7 +920,8 @@ class PadTransform(grain.MapTransform):
     for key, value in features.items():
       if key.endswith('_tokens'):
         result[key] = common.pad_to_len(
-            value, self.seq_len, self.pad_id, np.int32)
+            value, self.seq_len, self.pad_id, np.int32
+        )
       elif key.endswith('_weights'):
         result[key] = common.pad_to_len(value, self.seq_len, 0.0, np.float32)
       else:
@@ -871,6 +942,30 @@ PACKING_PAD_OR_TRUNCATE = 'pad_or_truncate'
 PACKING_NONE = 'none'
 
 
+# Batch mode constants.
+# Controls how examples are organized after batching.
+BATCH_STACKED = 'stacked'      # Default grain behavior: stack arrays (columnar)
+BATCH_UNSTACKED = 'unstacked'  # Keep as list of individual examples
+
+
+def get_batch_fn(batch_mode: str):
+  """Returns batch_fn for grain.batch() based on mode.
+
+  Args:
+    batch_mode: Either BATCH_STACKED or BATCH_UNSTACKED.
+
+  Returns:
+    None for BATCH_STACKED (default grain stacking), or identity function
+    for BATCH_UNSTACKED (keeps examples as list of dicts).
+  """
+  if batch_mode == BATCH_STACKED:
+    return None  # Default grain stacking
+  elif batch_mode == BATCH_UNSTACKED:
+    return lambda x: x  # Keep as list of examples
+  else:
+    raise ValueError(f'Unknown batch_mode: {batch_mode}')
+
+
 def _to_fixed_length(
     dataset: grain.IterDataset,
     seq_len: int,
@@ -885,15 +980,14 @@ def _to_fixed_length(
   Args:
     dataset: Input IterDataset with variable-length sequences.
     seq_len: Target sequence length.
-    packing_method: Method for creating fixed-length sequences:
-      - 'concat_split': Concatenate examples then split at seq_len boundaries.
-        Most efficient for throughput, packed sequences may span examples.
-      - 'first_fit': First-fit bin packing. Each packed sequence contains
-        complete examples (up to seq_len). Better for evaluation metrics.
-      - 'pad_or_truncate': Truncate long sequences, pad short ones.
-        One example per sequence with fixed length.
-      - 'none': No packing operations. Pass through as-is (for raw data
-        that's already formatted).
+    packing_method: Method for creating fixed-length sequences: -
+      'concat_split': Concatenate examples then split at seq_len boundaries.
+      Most efficient for throughput, packed sequences may span examples. -
+      'first_fit': First-fit bin packing. Each packed sequence contains complete
+      examples (up to seq_len). Better for evaluation metrics. -
+      'pad_or_truncate': Truncate long sequences, pad short ones. One example
+      per sequence with fixed length. - 'none': No packing operations. Pass
+      through as-is (for raw data that's already formatted).
     pad_id: Padding token ID (used for 'pad_or_truncate' method).
     seed: Random seed for deterministic packing (used for first_fit).
     num_packing_bins: Number of bins for first_fit packing.
@@ -927,9 +1021,8 @@ def _to_fixed_length(
         shuffle_bins=shuffle_bins,
     )
   elif packing_method == PACKING_PAD_OR_TRUNCATE:
-    return (
-        dataset.map(TruncateTransform(seq_len))
-        .map(PadTransform(seq_len, pad_id=pad_id))
+    return dataset.map(TruncateTransform(seq_len)).map(
+        PadTransform(seq_len, pad_id=pad_id)
     )
   elif packing_method == PACKING_NONE:
     return dataset
@@ -946,26 +1039,15 @@ def _to_fixed_length(
 ################################################################################
 
 
-def _load_hf_dataset(name: str, subset: str | None, split: str):
-  """Load a HuggingFace dataset. HF datasets support random access natively."""
-  import datasets  # pylint: disable=g-import-not-at-top
-
-  return datasets.load_dataset(name, name=subset, split=split)
-
-
-def get_data_source(config: DatasetConfig) -> grain.MapDataset:
+def get_data_source(source: str | SimpleDataSource) -> grain.MapDataset:
   """Creates a Grain MapDataset from config.
 
-  The data source is determined by config.source:
-  - If TFDSSourceConfig: Uses tensorflow_datasets
-  - If HFDatasetSourceConfig: Uses HuggingFace datasets library
-  - If str: Looks up in DataSourceRegistry
-
-  Note: This function returns raw (un-tokenized) data. For factory functions
-  in DatasetRegistry, the pipeline calls them directly to get tokenized data.
+  All data sources implement __len__ and __getitem__, so this function simply
+  wraps them with grain.MapDataset.source(). For string sources, looks up in
+  DataSourceRegistry first.
 
   Args:
-    config: DatasetConfig specifying the data source.
+    source: A string or SimpleDataSource.
 
   Returns:
     A grain.MapDataset that lazily loads data (un-tokenized).
@@ -973,51 +1055,18 @@ def get_data_source(config: DatasetConfig) -> grain.MapDataset:
   Raises:
     ValueError: If the data source cannot be found.
   """
-  source = config.source
-
-  # Handle TFDSSourceConfig.
-  if isinstance(source, TFDSSourceConfig):
-    import tensorflow_datasets as tfds  # pylint: disable=g-import-not-at-top
-    # Try array_record format first (preferred for grain).
-    tfds_source = tfds.data_source(source.name, split=source.split)
-    return grain.MapDataset.source(tfds_source)
-
-  # Handle HFDatasetSourceConfig.
-  # HF datasets support random access natively, so pass directly to grain.
-  if isinstance(source, HFDatasetSourceConfig):
-    hf_dataset = _load_hf_dataset(source.name, source.subset, source.split)
-    return grain.MapDataset.source(hf_dataset)
-
-  # Handle ArrayRecordSourceConfig.
-  if isinstance(source, ArrayRecordSourceConfig):
-    # Expand glob patterns in paths.
-    expanded_paths = []
-    for pattern in source.paths:
-
-      # matches = glob.glob(pattern)
-      if matches:
-        expanded_paths.extend(sorted(matches))
-      else:
-        # No glob match - use as literal path (will error if doesn't exist).
-        expanded_paths.append(pattern)
-    ar_source = grain.ArrayRecordDataSource(expanded_paths)
-    return grain.MapDataset.source(ar_source)
 
   # Handle string: look up in DataSourceRegistry.
   if isinstance(source, str):
-    if source in DataSourceRegistry.keys():
-      datasource = DataSourceRegistry.get_instance(source)
-      return grain.MapDataset.source(datasource)
+    if source not in DataSourceRegistry.keys():
+      raise ValueError(
+          f'Data source not found: {source}. Register it in DataSourceRegistry '
+          'or use TFDSSource/HFSource/ArrayRecordSource.'
+      )
+    source = DataSourceRegistry.get_instance(source)
 
-    raise ValueError(
-        f'Data source not found: {source}. Register it in DataSourceRegistry or'
-        ' use TFDSSourceConfig/HFDatasetSourceConfig for external datasets.'
-    )
-
-  raise ValueError(
-      f'Invalid source type: {type(source)}. Expected str, TFDSSourceConfig, '
-      'or HFDatasetSourceConfig.'
-  )
+  # All sources implement __len__/__getitem__, just wrap with grain.
+  return grain.MapDataset.source(source)
 
 
 ################################################################################
@@ -1058,7 +1107,7 @@ def _create_map_dataset(
   fmt_name = ds_config.lm_format_name
 
   # Step 1a: Get raw data source.
-  ds = get_data_source(ds_config)
+  ds = get_data_source(ds_config.source)
 
   # Step 1b: Deserialize TFExample protos if needed.
   # TFExampleDeserializeTransform handles both bytes (deserializes) and dicts
@@ -1114,8 +1163,8 @@ def create_iter_dataset(
   """Main entry point for creating datasets.
 
   Args:
-    config: ExperimentConfig with dataset configuration. Must have
-      dataset_config and optionally validation_dataset_config.
+    config: ExperimentConfig with dataset configuration. Must have dataset and
+      optionally validation_dataset.
     training: If True, creates training dataset; else validation dataset.
 
   Returns:
@@ -1123,15 +1172,12 @@ def create_iter_dataset(
   """
   # Determine dataset config and parameters based on training mode.
   if training:
-    ds_config = config.dataset_config
+    ds_config = config.dataset
     batch_size = config.batch_size
     shuffle = True
     num_epochs = None
   else:
-    ds_config = (
-        getattr(config, 'validation_dataset_config', None)
-        or config.dataset_config
-    )
+    ds_config = getattr(config, 'validation_dataset', None) or config.dataset
     batch_size = (
         config.validation_eval_batch_size
         if config.validation_eval_batch_size > 0
@@ -1146,6 +1192,7 @@ def create_iter_dataset(
   seed = config.dataset_seed
   prefetch_num_workers = config.prefetch_num_workers
   prefetch_per_worker_buffer_size = config.prefetch_per_worker_buffer_size
+  batch_mode = getattr(config, 'batch_mode', BATCH_STACKED)
 
   # Get pad_id from tokenizer (used for pad_or_truncate packing).
   tokenizer = _get_tokenizer(tokenizer_name)
@@ -1162,11 +1209,13 @@ def create_iter_dataset(
       )
     packing_method = packing if training else PACKING_PAD_OR_TRUNCATE
     return _to_fixed_length(
-        map_ds.to_iter_dataset(), seq_len, packing_method, pad_id, seed)
+        map_ds.to_iter_dataset(), seq_len, packing_method, pad_id, seed
+    )
 
   # Helper to apply batching and prefetching.
   def _finalize(iter_ds: grain.IterDataset) -> grain.IterDataset:
-    iter_ds = iter_ds.batch(batch_size, drop_remainder=True)
+    batch_fn = get_batch_fn(batch_mode)
+    iter_ds = iter_ds.batch(batch_size, drop_remainder=True, batch_fn=batch_fn)
     return iter_ds.mp_prefetch(
         grain.MultiprocessingOptions(
             num_workers=prefetch_num_workers,
@@ -1191,7 +1240,8 @@ def create_iter_dataset(
       if ds_config.pack_before_mix:
         packing_method = entry.packing if training else PACKING_PAD_OR_TRUNCATE
         ds = _to_fixed_length(
-            ds.to_iter_dataset(), seq_len, packing_method, pad_id, seed)
+            ds.to_iter_dataset(), seq_len, packing_method, pad_id, seed
+        )
       datasets.append(ds)
       weights.append(weight)
       packings.append(entry.packing)
@@ -1199,14 +1249,19 @@ def create_iter_dataset(
     if ds_config.pack_before_mix:
       iter_ds = grain.IterDataset.mix(datasets, weights=weights)
     else:
-      # For mix-then-pack, use the most conservative packing method.
-      # If any dataset uses first_fit, use that to preserve example boundaries.
-      mixed_packing = (
-          PACKING_FIRST_FIT if PACKING_FIRST_FIT in packings
-          else PACKING_CONCAT_SPLIT
-      )
-      iter_ds = _pack(
-          grain.MapDataset.mix(datasets, weights=weights), mixed_packing)
+      # For mix-before-pack, determine the packing method:
+      # - If ALL datasets use 'none', use 'none' (no packing for raw data)
+      # - If any uses 'first_fit', use that (preserves example boundaries)
+      # - Otherwise use 'concat_split' (best throughput)
+      unique_packings = set(packings)
+      if unique_packings == {PACKING_NONE}:
+        mixed_packing = PACKING_NONE
+      elif PACKING_FIRST_FIT in packings:
+        mixed_packing = PACKING_FIRST_FIT
+      else:
+        mixed_packing = PACKING_CONCAT_SPLIT
+      mixed_ds = grain.MapDataset.mix(datasets, weights=weights)
+      iter_ds = _pack(mixed_ds, mixed_packing)
     return _finalize(iter_ds)
 
   # Single DatasetConfig.

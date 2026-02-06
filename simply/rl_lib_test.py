@@ -150,7 +150,7 @@ class RunExperimentTest(absltest.TestCase):
         config_lib.lm_rl_test(),
         num_train_steps=num_train_steps,
         ckpt_interval=num_train_steps,
-        dataset_config=data_lib.DatasetConfig(
+        dataset=data_lib.DatasetConfig(
             source='simply_json:mock_dsr40k_train',
             # RL pipeline expects raw data - it handles formatting via
             # evaluation.get_sampling_input().

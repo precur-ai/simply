@@ -376,11 +376,11 @@ class RaggedArray:
         total_repeat_length=self.capacity,
     )
 
-  def row(self, idx: jax.typing.ArrayLike) -> jax.Array:
+  def row(self, idx: jax.typing.ArrayLike) -> np.ndarray:
     """Returns the row at the given index."""
     if jnp.ndim(idx) != 0:
       raise ValueError(f'Row index must be 0d: {jnp.shape(idx)=}')
-    return self.data[
+    return np.asarray(self.data)[
         self.row_starts_with_end[idx] : self.row_starts_with_end[idx + 1]
     ]
 

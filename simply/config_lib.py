@@ -296,12 +296,13 @@ class BaseExperimentConfig(ExperimentConfig):
   # Position encoding config. Can be:
   # - Single config (e.g., pe_lib.RoPE()) to apply to all layers
   # - Mapping {pattern: config} for per-pattern config (e.g., 'global', 'local')
+  #   names of the patterns are defined in `block_attn_pattern`.
   # - None for NoPE (no positional encoding)
   position_encoding: (
       Mapping[str, pe_lib.PositionEncodingConfig | None]
       | pe_lib.PositionEncodingConfig
       | None
-  ) = dataclasses.field(default_factory=pe_lib.RoPE)
+  ) = pe_lib.RoPE()
   query_scale: float = -1.0
   # MoE related.
   use_moe: bool = False
@@ -320,10 +321,14 @@ class BaseExperimentConfig(ExperimentConfig):
 
   # Data config
   batch_size: int = 64 * 16
-  dataset_name: str = 'lm1b'
+  # Dataset configuration.
+  # Set to DatasetConfig, MixtureConfig, or string
+  # (DatasetConfigRegistry lookup).
+  dataset: Any | None = None
+  validation_dataset: Any | None = None
+  # RL requires unstacked batch to iterate over examples.
+  batch_mode: str = data_lib.BATCH_STACKED
   dataset_seed: int = 42
-  use_packing: bool = True
-  use_validation_set: bool = False
   # How many steps / validation examples to evaluate on,
   # set to -1 to use whole set
   validation_num_eval_steps: int = -1
@@ -334,20 +339,18 @@ class BaseExperimentConfig(ExperimentConfig):
   validation_eval_batch_size: int = -1
   # Number of epochs to run evaluation on validation set.
   validation_eval_epochs: int = 1
-  # NOTE: This is only used when `use_validation_set` is True. If not set,
-  # `dataset_name` will be used.
-  validation_dataset_name: str | None = None
-  feature_converter_name: str = 'LMFeatureConverter'
   # Number of prefetch workers for the data pipeline. Since we use
   # pygrain's multi-processing prefetching, this is the number of processes.
   # Set to 0 to disable multi-processing. Note that changing
   # prefetch_num_workers will change the order of the data loading.
   prefetch_num_workers: int = 8
   prefetch_per_worker_buffer_size: int = 2
-
-  # WIP field for configuring datasets.
-  dataset_config: Any | None = None
-  validation_dataset_config: Any | None = None
+  # The following fields are deprecated, use `dataset` instead.
+  dataset_name: str = ''
+  use_packing: bool = True
+  use_validation_set: bool = False
+  validation_dataset_name: str | None = None
+  feature_converter_name: str = 'LMFeatureConverter'
 
   # Training config
   train_loop_name: str = 'default'
@@ -463,6 +466,9 @@ class RLExperimentConfig(BaseExperimentConfig):
   sampling_intermediate_decode_steps: int = 1024
   sampling_max_tool_response_len: int = 1024
 
+  # RL requires unstacked batch to iterate over examples.
+  batch_mode: str = data_lib.BATCH_UNSTACKED
+
   # How many training steps to run given one batch of samples.
   num_train_steps_per_batch: int = 1
   max_num_samples_per_train_batch: int | None = None
@@ -506,6 +512,7 @@ def apply_simple_rl(config):
       num_train_steps=1_000_000,
       train_batch_size=16 * 8,
       batch_size=16,
+      batch_mode=data_lib.BATCH_UNSTACKED,
       num_samples_per_example=8,
       sampling_temperature=1.0,
       num_train_steps_per_batch=1,
@@ -566,29 +573,15 @@ def flops6e20_tfm2b_c4_l2048():
       expand_factor=8,
       seq_len=2048,
       vocab_size=100_864,
-      dataset_config=data_lib.DatasetConfig(
-          source=data_lib.TFDSSourceConfig(
-              name='c4:3.1.0',
-              split='train',
-          ),
-          data_key='text',
-          packing=data_lib.PACKING_CONCAT_SPLIT,
-          add_eos=True,
-          add_bos=True,
-          lm_format_name='Pretrain',
-      ),
-      validation_dataset_config=data_lib.DatasetConfig(
-          source=data_lib.TFDSSourceConfig(
-              name='c4:3.1.0',
-              split='validation',
-          ),
-          data_key='text',
-          packing=data_lib.PACKING_CONCAT_SPLIT,
-          add_eos=True,
-          add_bos=True,
-          lm_format_name='Pretrain',
-      ),
       vocab_name='vb100864_openmix_v1',
+      dataset=data_lib.DatasetConfig(
+          source=data_lib.TFDSSource(name='c4:3.1.0', split='train'),
+          lm_format_name='Pretrain',
+      ),
+      validation_dataset=data_lib.DatasetConfig(
+          source=data_lib.TFDSSource(name='c4:3.1.0', split='validation'),
+          lm_format_name='Pretrain',
+      ),
       batch_size=1024,
       clip_grad_norm=1.0,
       num_train_steps=21_297,
@@ -600,7 +593,6 @@ def flops6e20_tfm2b_c4_l2048():
           end_decay=0.1,
       ),
       ckpt_max_to_keep=1,
-      use_validation_set=True,
       validation_num_eval_steps=2,
       validation_eval_interval=1000,
       validation_eval_batch_size=1024,
@@ -828,11 +820,13 @@ def gemma2_2b_c4_vocab100864_l2048_bs1024():
   config = gemma2_2b()
   return dataclasses.replace(
       config,
-      dataset_name='c4.vb100864_openmix_v1',
+      dataset=data_lib.DatasetConfig(
+          source=data_lib.TFDSSource(name='c4:3.1.0', split='train'),
+          lm_format_name='Pretrain',
+      ),
       seq_len=2048,  # 4096 // 2
       vocab_size=100_864,
       init_ckpt_dir='',
-      use_validation_set=False,
       num_train_steps=45_000,
   )
 
@@ -1033,7 +1027,6 @@ def gemma3_12b_it_dsr40k_b2k_l10k_rl():  # PF_4x4x8
       init_ckpt_dir=GEMMA3_12B_IT_CKPT_DIR,
       tb_log_interval=1,
       ckpt_interval=5,
-      use_validation_set=False,
   )
   return config
 
@@ -1044,12 +1037,15 @@ def gemma2_2b_gsm8k_0shot_rl():
   config = apply_simple_rl(config)
   return dataclasses.replace(
       config,
-      dataset_name='simply_json:gsm8k_train',
+      dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_train', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
       evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
-      use_validation_set=True,
       validation_num_eval_steps=8,
       validation_eval_interval=100,
-      validation_dataset_name='simply_json:gsm8k_test',
+      validation_dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_test', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
       validation_eval_batch_size=-1,
       validation_eval_epochs=1,
       lm_format_name='Pretrain',
@@ -1096,7 +1092,9 @@ def gemma2_2b_dsr40k_0shot_rl():
   config = gemma2_2b_gsm8k_0shot_rl()
   return dataclasses.replace(
       config,
-      dataset_name='simply_json:dsr40k_train',
+      dataset=data_lib.DatasetConfig(
+          source='simply:dsr40k_train', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
   )
 
 
@@ -1167,7 +1165,9 @@ def gemma2_2b_gsm8k_32examples_rl():
   config = gemma2_2b()
   return dataclasses.replace(
       config,
-      dataset_name='simply_json:gsm8k_train32',
+      dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_train32', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
   )
 
 
@@ -1198,7 +1198,9 @@ def gemma2_2b_it_dsr40k_0shot_rl():
   config = gemma2_2b_it_gsm8k_0shot_rl()
   return dataclasses.replace(
       config,
-      dataset_name='simply_json:dsr40k_train',
+      dataset=data_lib.DatasetConfig(
+          source='simply:dsr40k_train', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
   )
 
 
@@ -1221,7 +1223,9 @@ def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
       init_ckpt_dir=GEMMA3_4B_IT_CKPT_DIR,
       lm_format_name='GemmaV2Chat',
       # Dataset & evaluation config.
-      dataset_name='simply_json:simple_qa_num',
+      dataset=data_lib.DatasetConfig(
+          source='simply:simple_qa_num', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
       evaluation=evaluation_lib.QAToolUseEvaluation(),
       # Tool config.
       tool_manager_name='GoogleSearchToolExecutor',
@@ -1242,7 +1246,6 @@ def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
       num_train_steps=500,
       num_train_steps_per_batch=4,
       max_num_samples_per_train_batch=None,
-      use_validation_set=False,
       train_batch_size=16 * 32,
       batch_size=32,
       grad_accum_steps=8,
@@ -1364,7 +1367,9 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
   config = apply_simple_rl(config)
   return dataclasses.replace(
       config,
-      dataset_name='simply_json:dsr40k_train',
+      dataset=data_lib.DatasetConfig(
+          source='simply:dsr40k_train', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
       num_train_steps=1_000_000,
       train_loop_name='rl',
       train_batch_size=16 * 8,
@@ -1397,9 +1402,10 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
       extra_eos_tokens=(),
       use_flash_attention=True,
       flash_attention_block_size=512,
-      use_validation_set=True,
       validation_eval_interval=50,
-      validation_dataset_name='simply_json:aime24',
+      validation_dataset=data_lib.DatasetConfig(
+          source='simply:aime24', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
       validation_eval_batch_size=64,
       validation_eval_epochs=5,
       validation_evaluation=None,
@@ -1479,7 +1485,6 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
-      use_validation_set=True,
       validation_eval_batch_size=64,
       validation_eval_interval=50,
       use_policy_logp_as_sampler_logp=True,
@@ -1615,7 +1620,6 @@ def deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
-      use_validation_set=True,
       validation_eval_interval=50,
       validation_eval_batch_size=32,
       use_policy_logp_as_sampler_logp=True,
@@ -1882,26 +1886,15 @@ def lm_test():
       # Data config
       num_train_steps=50,
       batch_size=4,
+      vocab_size=32_000,
       seq_len=64,
       prefetch_num_workers=0,
       prefetch_per_worker_buffer_size=2,
-      dataset_config=data_lib.DatasetConfig(
-          source=data_lib.TFDSSourceConfig(
-              name='imdb_reviews',
-              split='train[:1000]',
-          ),
-          data_key='text',
-      ),
-      validation_dataset_config=data_lib.DatasetConfig(
-          source=data_lib.TFDSSourceConfig(
-              name='imdb_reviews',
-              split='test[:100]',
-          ),
-          data_key='text',
-      ),
       vocab_name='Qwen3',
-      vocab_size=151_669,
-      # Optimizer config
+      dataset=data_lib.DatasetConfig(
+          source=data_lib.TFDSSource(name='imdb_reviews', split='train'),
+          lm_format_name='Pretrain',
+      ),
       lr=opt_lib.LinearWarmupCosineDecay(
           value=1e-3,
           warmup_steps=10,
@@ -1910,7 +1903,6 @@ def lm_test():
       ),
       clip_grad_norm=-1.0,
       clip_update_norm=-1.0,
-      use_validation_set=True,
       validation_num_eval_steps=2,
       validation_eval_interval=5,
       validation_eval_batch_size=-1,
@@ -1918,16 +1910,6 @@ def lm_test():
       ckpt_interval=10,
       ckpt_max_to_keep=3,
       tb_log_interval=2,
-  )
-
-
-@ExperimentConfigRegistry.register
-def lm_c4_test():
-  config = lm_test()
-  return dataclasses.replace(
-      config,
-      seq_len=4096,
-      dataset_name='c4.vb100864_openmix_v1',
   )
 
 
@@ -1942,39 +1924,18 @@ def lm_no_scan_test():
 
 
 @ExperimentConfigRegistry.register
-def lm_sft_test():
-  config = lm_test()
-  return dataclasses.replace(
-      config,
-      num_train_steps=2000,
-      lr=opt_lib.LinearWarmupCosineDecay(
-          value=1e-4,
-          warmup_steps=100,
-          steps_after_decay=10,
-          end_decay=0.1,
-      ),
-      dataset_name='tulu_v2_sft.vb100864_openmix_v1',
-      # Config for init from existing checkpoint.
-      init_ckpt_dir='/tmp/simply_test_pt_1/checkpoints',
-      init_ckpt_step=-1,
-      use_validation_set=False,
-      # Add masks to only calculate loss on assistant responses.
-      add_chat_loss_mask=True,
-      mask_start_token='<reserved_2>',
-      mask_end_token='<reserved_4>',
-  )
-
-
-@ExperimentConfigRegistry.register
 def lm_rl_test():
   config = RLExperimentConfig().override_from(lm_test())
   return dataclasses.replace(
       config,
-      dataset_name='simply_json:dsr40k_train',
+      batch_mode=data_lib.BATCH_UNSTACKED,
+      dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_train',
+          packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
       num_train_steps=30,
       train_loop_name='rl',
       evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
-      use_validation_set=False,
       vocab_name='vb32768_openmix_v1',
       lm_format_name='SimplyV1Chat',
       batch_size=4,
