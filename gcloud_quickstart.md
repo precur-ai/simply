@@ -1,7 +1,7 @@
 # Simply on GCloud: Quickstart
 
 A minimal guide to run your first Simply experiment on a GCloud TPU.
-For multi-host pods, GPU VMs, preemption handling, and other advanced
+For multi-host TPU pods, preemption handling, and other advanced
 topics, see the [full guide](docs/gcloud.md).
 
 ## Prerequisites
@@ -158,4 +158,4 @@ See the [full guide](docs/gcloud.md) for:
   `--worker=all`, `jax.distributed.initialize()`
 - **Preemption handling** -- bastion VM with auto-retry loop
 - **Monitoring** -- TensorBoard, SSH probes, serial port logs
-- **Common gotchas** -- LR schedule traps, OOM fixes, SSH issues
+- **Common gotchas** -- OOM fixes, SSH issues

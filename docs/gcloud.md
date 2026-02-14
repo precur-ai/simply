@@ -403,17 +403,6 @@ import jax
 jax.distributed.initialize()
 ```
 
-### Learning Rate Schedule + `num_train_steps`
-
-`CosineDecay` schedules decay the learning rate to 0 over
-`num_train_steps`. If `num_train_steps=1_000_000` (the default), the
-LR is effectively constant for the first few thousand steps. But if
-you override `num_train_steps=2000`, the LR decays to 0 over those
-2000 steps, killing learning.
-
-**Fix**: Use `LinearWarmupConstant` for short runs. This is what
-`gemma2_2b_gsm8k_2k_rl_16` does.
-
 ### `grad_accum_steps` for OOM
 
 The RL training loop materializes full logits tensors during
@@ -428,22 +417,6 @@ The gradient is mathematically identical.
 `--worker=all` can fail if SSH keys haven't been exchanged with each
 worker. Always warm up keys first by SSHing into each worker
 individually (see the multi-host example above).
-
-### `pkill` Bracket Trick
-
-When killing processes via SSH `--command`, the pattern in `pkill -f`
-can match the bash shell running the command itself:
-
-```bash
-# BAD: kills itself
-pkill -f 'python3 -m simply.main'
-
-# GOOD: bracket trick prevents self-match
-pkill -9 -f '[p]ython3 -m simply.main'
-```
-
-The regex `[p]ython3` matches `python3` but does not match the
-literal string `[p]ython3`.
 
 ### `--worker=all` Buffers Output
 
