@@ -70,7 +70,9 @@ class SimplySentencePieceVocab(SimplyVocab[str]):
 
   def __init__(self, vocab_path: str):
     self._sp = spm.SentencePieceProcessor()
-    self._sp.Load(vocab_path)
+    self._sp.LoadFromSerializedProto(
+        epath.Path(vocab_path).read_bytes()
+    )
     self.bos_id = self._sp.bos_id()
     self.pad_id = self._sp.pad_id()
     self.eos_id = self._sp.eos_id()
@@ -91,8 +93,8 @@ class HuggingFaceVocab(SimplyVocab[str]):
   @functools.cached_property
   def tokenizer(self) -> tokenizers.Tokenizer:
     vocab_path = epath.Path(self.vocab_path)
-    return tokenizers.Tokenizer.from_file(
-        (vocab_path / 'tokenizer.json').as_posix()
+    return tokenizers.Tokenizer.from_buffer(
+        (vocab_path / 'tokenizer.json').read_bytes()
     )
 
   @functools.cached_property
