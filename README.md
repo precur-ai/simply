@@ -20,6 +20,9 @@ Or if you want to debug by printing arrays like normal python code, you can disa
 export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_no_scan_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 
+#### Running on Google Cloud TPUs
+See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
+
 ## Dependencies
 
 The main dependencies are:
