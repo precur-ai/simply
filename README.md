@@ -40,8 +40,13 @@ pip install -U jax
 pip install -U "jax[cuda13]"
 # TPU:
 pip install -U "jax[tpu]"
-# Other dependencies:
-pip install -r requirements.txt
+
+# Install simply and its dependencies:
+pip install .
+# With optional dependencies:
+pip install ".[tfds]"       # for TensorFlow Datasets
+pip install ".[math-eval]"  # for simply/utils/math_eval.py
+pip install ".[dev]"        # for testing (pytest)
 ```
 
 ## Setup Model Checkpoints and Datasets

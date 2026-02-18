@@ -167,7 +167,13 @@ def main(argv: Sequence[str]) -> None:
   del argv
 
   import jax
-  jax.distributed.initialize()  # setup jax for multi-host training.
+  try:
+    jax.distributed.initialize()  # setup jax for multi-host training.
+  except ValueError:
+    logging.info(
+        'Multi-host initialization failed. '
+        'Falling back to single-host setup.'
+    )
 
   experiment_helper.setup_work_unit()
   config, experiment_dir = load_experiment_config()

@@ -1,16 +1,3 @@
-orbax
-grain
-einops
-absl-py
-tensorboard
-tensorboardX
-deprecated
-pytest
-datasets
-tokenizers
-tensorflow_datasets
-tensorflow-cpu  # for tfds utilities
-sentencepiece
-# Following packages are only required for running simply/utils/math_eval.py
-sympy
-pylatexenc
+# This file is a thin wrapper around pyproject.toml.
+# Prefer: pip install . or pip install ".[tfds,dev]"
+.

@@ -1,16 +1,20 @@
 [project]
 name = "simply"
-version = "0.3.4"
+version = "0.3.7"
 description = "Simply: Minimal Code for Frontier LLM Research in JAX"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "absl-py>=2.3.1",
-    "clu>=0.0.12",
+    "datasets",
+    "deprecated",
     "einops>=0.8.1",
     "grain>=0.2.15",
     "orbax>=0.1.9",
+    "sentencepiece",
     "tensorboard>=2.20.0",
+    "tensorboardX",
+    "tokenizers",
 ]
 
 
@@ -20,6 +24,18 @@ gpu = [
 ]
 tpu = [
     "jax[tpu]>=0.8.2",
+]
+tfds = [
+    "tensorflow-cpu; sys_platform != 'darwin'",
+    "tensorflow; sys_platform == 'darwin'",
+    "tensorflow_datasets",
+]
+math-eval = [
+    "sympy",
+    "pylatexenc",
+]
+dev = [
+    "pytest",
 ]
 
 [tool.setuptools.packages.find]
