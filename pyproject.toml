@@ -14,16 +14,17 @@ dependencies = [
     "sentencepiece",
     "tensorboard>=2.20.0",
     "tensorboardX",
+    "jax",
     "tokenizers",
 ]
 
 
 [project.optional-dependencies]
 gpu = [
-    "jax[cuda13]",
+    "jax[cuda13]; sys_platform == 'linux'",
 ]
 tpu = [
-    "jax[tpu]>=0.8.2",
+    "jax[tpu]>=0.8.2; sys_platform == 'linux'",
 ]
 tfds = [
     "tensorflow-cpu; sys_platform != 'darwin'",
