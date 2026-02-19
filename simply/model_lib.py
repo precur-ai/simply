@@ -2679,6 +2679,10 @@ def run_experiment(
       metric_log_interval=config.tb_log_interval,
       log_additional_info=config.log_additional_info,
       should_save_ckpt=config.should_save_ckpt,
+      use_wandb=config.use_wandb,
+      wandb_project=config.wandb_project,
+      wandb_name=config.wandb_name,
+      wandb_config=dataclasses.asdict(config),
   )
   model, extra_output = create_model(config, config.sharding_config)
   teacher_model = extra_output.get('teacher')

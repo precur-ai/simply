@@ -17,6 +17,8 @@ dependencies = [
     "tensorboardX",
     "jax",
     "tokenizers",
+    "wandb>=0.25.0",
+    "tensorflow-datasets>=4.9.9",
 ]
 
 

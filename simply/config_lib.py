@@ -386,6 +386,9 @@ class BaseExperimentConfig(ExperimentConfig):
   ckpt_keep_period: int | None = None
   tb_log_interval: int = 100
   log_additional_info: bool = True
+  use_wandb: bool = False
+  wandb_project: str = 'simply'
+  wandb_name: str | None = None
 
   # Config for init from existing checkpoint.
   init_ckpt_dir: str = ''

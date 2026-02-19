@@ -69,6 +69,10 @@ class ExperimentHelper:
   num_train_steps: int = 0
   log_additional_info: bool = False
   should_save_ckpt: bool = True
+  use_wandb: bool = False
+  wandb_project: str = 'simply'
+  wandb_name: str | None = None
+  wandb_config: dict | None = None
 
   @property
   def should_save_data(self) -> bool:
@@ -143,8 +147,20 @@ class ExperimentHelper:
       return None
     metric_logdir = epath.Path(self.metric_logdir)
     metric_logdir.mkdir(parents=True, exist_ok=True)
-    return metric_writer_lib.create_metric_writer(
-        logdir=str(metric_logdir), just_logging=not self.should_save_data
+    tb_writer = metric_writer_lib.create_metric_writer(
+        logdir=str(metric_logdir),
+        just_logging=not self.should_save_data,
+    )
+    if not self.use_wandb:
+      return tb_writer
+    wandb_writer = metric_writer_lib.create_wandb_metric_writer(
+        project=self.wandb_project,
+        name=self.wandb_name,
+        dir=str(metric_logdir),
+        config=self.wandb_config,
+    )
+    return metric_writer_lib.MultiMetricWriter(
+        [tb_writer, wandb_writer]
     )
 
   @functools.cached_property
