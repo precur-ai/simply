@@ -18,7 +18,6 @@ dependencies = [
     "jax",
     "tokenizers",
     "wandb>=0.25.0",
-    "tensorflow-datasets>=4.9.9",
 ]
 
 
@@ -32,7 +31,7 @@ tpu = [
 tfds = [
     "tensorflow-cpu; sys_platform != 'darwin'",
     "tensorflow; sys_platform == 'darwin'",
-    "tensorflow_datasets",
+    "tensorflow-datasets>=4.9.9",
 ]
 gcloud = [
     "gcsfs",
